@@ -6,17 +6,25 @@ import {
 } from 'react'
 import { useTranslation } from 'react-i18next'
 import { produce, setAutoFreeze } from 'immer'
+import { uniqBy } from 'lodash-es'
 import { useWorkflowRun } from '../../hooks'
 import { NodeRunningStatus, WorkflowRunningStatus } from '../../types'
 import type {
   ChatItem,
   Inputs,
-  PromptVariable,
 } from '@/app/components/base/chat/types'
+import type { InputForm } from '@/app/components/base/chat/chat/type'
+import {
+  getProcessedInputs,
+  processOpeningStatement,
+} from '@/app/components/base/chat/chat/utils'
 import { useToastContext } from '@/app/components/base/toast'
 import { TransferMethod } from '@/types/app'
-import type { VisionFile } from '@/types/app'
-import { replaceStringWithValues } from '@/app/components/app/configuration/prompt-value-panel'
+import {
+  getProcessedFiles,
+  getProcessedFilesFromResponse,
+} from '@/app/components/base/file-uploader/utils'
+import type { FileEntity } from '@/app/components/base/file-uploader/types'
 
 type GetAbortController = (abortController: AbortController) => void
 type SendCallback = {
@@ -24,9 +32,9 @@ type SendCallback = {
 }
 export const useChat = (
   config: any,
-  promptVariablesConfig?: {
+  formSettings?: {
     inputs: Inputs
-    promptVariables: PromptVariable[]
+    inputsForm: InputForm[]
   },
   prevChatList?: ChatItem[],
   stopChat?: (taskId: string) => void,
@@ -35,7 +43,7 @@ export const useChat = (
   const { notify } = useToastContext()
   const { handleRun } = useWorkflowRun()
   const hasStopResponded = useRef(false)
-  const connversationId = useRef('')
+  const conversationId = useRef('')
   const taskIdRef = useRef('')
   const [chatList, setChatList] = useState<ChatItem[]>(prevChatList || [])
   const chatListRef = useRef<ChatItem[]>(prevChatList || [])
@@ -62,8 +70,8 @@ export const useChat = (
   }, [])
 
   const getIntroduction = useCallback((str: string) => {
-    return replaceStringWithValues(str, promptVariablesConfig?.promptVariables || [], promptVariablesConfig?.inputs || {})
-  }, [promptVariablesConfig?.inputs, promptVariablesConfig?.promptVariables])
+    return processOpeningStatement(str, formSettings?.inputs || {}, formSettings?.inputsForm || [])
+  }, [formSettings?.inputs, formSettings?.inputsForm])
   useEffect(() => {
     if (config?.opening_statement) {
       handleUpdateChatList(produce(chatListRef.current, (draft) => {
@@ -100,7 +108,7 @@ export const useChat = (
   }, [handleResponding, stopChat])
 
   const handleRestart = useCallback(() => {
-    connversationId.current = ''
+    conversationId.current = ''
     taskIdRef.current = ''
     handleStop()
     const newChatList = config?.opening_statement
@@ -143,7 +151,11 @@ export const useChat = (
   }, [handleUpdateChatList])
 
   const handleSend = useCallback((
-    params: any,
+    params: {
+      query: string
+      files?: FileEntity[]
+      [key: string]: any
+    },
     {
       onGetSuggestedQuestions,
     }: SendCallback,
@@ -182,12 +194,14 @@ export const useChat = (
 
     handleResponding(true)
 
+    const { files, inputs, ...restParams } = params
     const bodyParams = {
-      conversation_id: connversationId.current,
-      ...params,
+      files: getProcessedFiles(files || []),
+      inputs: getProcessedInputs(inputs || {}, formSettings?.inputsForm || []),
+      ...restParams,
     }
     if (bodyParams?.files?.length) {
-      bodyParams.files = bodyParams.files.map((item: VisionFile) => {
+      bodyParams.files = bodyParams.files.map((item) => {
         if (item.transfer_method === TransferMethod.local_file) {
           return {
             ...item,
@@ -201,7 +215,7 @@ export const useChat = (
     let hasSetResponseId = false
 
     handleRun(
-      params,
+      bodyParams,
       {
         onData: (message: string, isFirstMessage: boolean, { conversationId: newConversationId, messageId, taskId }: any) => {
           responseItem.content = responseItem.content + message
@@ -212,7 +226,7 @@ export const useChat = (
           }
 
           if (isFirstMessage && newConversationId)
-            connversationId.current = newConversationId
+            conversationId.current = newConversationId
 
           taskIdRef.current = taskId
           if (messageId)
@@ -246,15 +260,22 @@ export const useChat = (
           }
 
           if (config?.suggested_questions_after_answer?.enabled && !hasStopResponded.current && onGetSuggestedQuestions) {
-            const { data }: any = await onGetSuggestedQuestions(
-              responseItem.id,
-              newAbortController => suggestedQuestionsAbortControllerRef.current = newAbortController,
-            )
-            setSuggestQuestions(data)
+            try {
+              const { data }: any = await onGetSuggestedQuestions(
+                responseItem.id,
+                newAbortController => suggestedQuestionsAbortControllerRef.current = newAbortController,
+              )
+              setSuggestQuestions(data)
+            }
+            catch (error) {
+              setSuggestQuestions([])
+            }
           }
         },
         onMessageEnd: (messageEnd) => {
           responseItem.citation = messageEnd.metadata?.retriever_resources || []
+          const processedFilesFromResponse = getProcessedFilesFromResponse(messageEnd.files || [])
+          responseItem.allFiles = uniqBy([...(responseItem.allFiles || []), ...(processedFilesFromResponse || [])], 'id')
 
           const newListWithAnswer = produce(
             chatListRef.current.filter(item => item.id !== responseItem.id && item.id !== placeholderAnswerId),
@@ -297,7 +318,49 @@ export const useChat = (
             }
           }))
         },
+        onIterationStart: ({ data }) => {
+          responseItem.workflowProcess!.tracing!.push({
+            ...data,
+            status: NodeRunningStatus.Running,
+            details: [],
+          } as any)
+          handleUpdateChatList(produce(chatListRef.current, (draft) => {
+            const currentIndex = draft.findIndex(item => item.id === responseItem.id)
+            draft[currentIndex] = {
+              ...draft[currentIndex],
+              ...responseItem,
+            }
+          }))
+        },
+        onIterationNext: ({ data }) => {
+          const tracing = responseItem.workflowProcess!.tracing!
+          const iterations = tracing.find(item => item.node_id === data.node_id
+            && (item.execution_metadata?.parallel_id === data.execution_metadata?.parallel_id || item.parallel_id === data.execution_metadata?.parallel_id))!
+          iterations.details!.push([])
+
+          handleUpdateChatList(produce(chatListRef.current, (draft) => {
+            const currentIndex = draft.length - 1
+            draft[currentIndex] = responseItem
+          }))
+        },
+        onIterationFinish: ({ data }) => {
+          const tracing = responseItem.workflowProcess!.tracing!
+          const iterationsIndex = tracing.findIndex(item => item.node_id === data.node_id
+            && (item.execution_metadata?.parallel_id === data.execution_metadata?.parallel_id || item.parallel_id === data.execution_metadata?.parallel_id))!
+          tracing[iterationsIndex] = {
+            ...tracing[iterationsIndex],
+            ...data,
+            status: NodeRunningStatus.Succeeded,
+          } as any
+          handleUpdateChatList(produce(chatListRef.current, (draft) => {
+            const currentIndex = draft.length - 1
+            draft[currentIndex] = responseItem
+          }))
+        },
         onNodeStarted: ({ data }) => {
+          if (data.iteration_id)
+            return
+
           responseItem.workflowProcess!.tracing!.push({
             ...data,
             status: NodeRunningStatus.Running,
@@ -311,9 +374,16 @@ export const useChat = (
           }))
         },
         onNodeFinished: ({ data }) => {
-          const currentIndex = responseItem.workflowProcess!.tracing!.findIndex(item => item.node_id === data.node_id)
+          if (data.iteration_id)
+            return
+
+          const currentIndex = responseItem.workflowProcess!.tracing!.findIndex((item) => {
+            if (!item.execution_metadata?.parallel_id)
+              return item.node_id === data.node_id
+            return item.node_id === data.node_id && (item.execution_metadata?.parallel_id === data.execution_metadata?.parallel_id || item.parallel_id === data.execution_metadata?.parallel_id)
+          })
           responseItem.workflowProcess!.tracing[currentIndex] = {
-            ...(responseItem.workflowProcess!.tracing[currentIndex].extras
+            ...(responseItem.workflowProcess!.tracing[currentIndex]?.extras
               ? { extras: responseItem.workflowProcess!.tracing[currentIndex].extras }
               : {}),
             ...data,
@@ -328,11 +398,13 @@ export const useChat = (
         },
       },
     )
-  }, [handleRun, handleResponding, handleUpdateChatList, notify, t, updateCurrentQA, config.suggested_questions_after_answer?.enabled])
+  }, [handleRun, handleResponding, handleUpdateChatList, notify, t, updateCurrentQA, config.suggested_questions_after_answer?.enabled, formSettings])
 
   return {
-    conversationId: connversationId.current,
+    conversationId: conversationId.current,
     chatList,
+    chatListRef,
+    handleUpdateChatList,
     handleSend,
     handleStop,
     handleRestart,
